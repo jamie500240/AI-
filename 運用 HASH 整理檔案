@@ -1,229 +1,367 @@
 import os
 import shutil
 import hashlib
-import sys
 import time
 import re
 import csv
 import traceback
 from pathlib import Path
 from datetime import datetime
+from dataclasses import dataclass
 import tkinter as tk
 from tkinter import filedialog
 
-# ==========================================
-# SSOT: 單一設定中心 (所有邏輯以此為準)
-# ==========================================
-CONFIG = {
-    "BUFFER_SIZE": 1024 * 1024,      # 1MB 緩衝
-    "SHA_DISPLAY_LEN": 16,           # DNA 短碼長度
-    "LOCK_RETRY_LIMIT": 3,           # 檔案佔用重試次數
-    "WORKSPACE_NAME": "GOD_CLEANUP_WORKSPACE",
-    "REPORT_NAME": "God_Cleanup_Inventory.csv",
-    "MAX_STEM_LEN": 30               # 檔名截斷長度
-}
+# =============================================================================
+# [SET] 領域層：全域系統設定 (Immutable Configuration)
+# =============================================================================
+@dataclass(frozen=True)
+class AppConfig:
+    # 核心參數
+    BUFFER_SIZE: int = 1024 * 1024        # 檔案讀取緩衝區大小 (1MB)
+    HASH_LENGTH: int = 16                 # SHA-256 截斷長度
+    ESTIMATE_MB_PER_SEC: float = 50.0     # DRY RUN 預估速度 (MB/s)
+    SAFE_SPACE_RATIO: float = 1.1         # 安全磁碟空間倍率 (需求空間的 1.1 倍)
+    
+    # 資料夾命名
+    DIR_TEMP: str = "0_Temp_Processing"
+    DIR_UNIQUE: str = "1_Unique_Archive"
+    DIR_DUPLICATE: str = "2_Duplicates_Isolation"
+    DIR_FAILED: str = "3_Failed_Items"
+    REPORT_FILENAME: str = "Process_Report.csv"
+    
+    # 功能開關 (Toggleable Features)
+    ENABLE_FILENAME_RESTORE: bool = True  # 是否在最後階段移除 Unique 區的 Hash 標記
+    ENABLE_DIR_FLATTENING: bool = True    # 是否執行資料夾扁平化 (移除少於 2 個項目的子目錄)
+    MIN_ITEMS_FOR_DIR: int = 2            # 目錄保留的最小項目數量門檻
 
-class GodCleanup:
-    """
-    God Object: 檔案清理自動化核心。
-    針對單層或多層資料夾進行全自動 DNA (SHA256) 比對分類。
-    """
-    def __init__(self):
-        self.source = self._ui_choose_folder()
-        if not self.source:
-            print("❌ 未選擇資料夾，程式終止。")
-            self._pause_and_exit(0)
+CONFIG = AppConfig()
 
-        # 建立具備辨識度的獨立工作空間
-        source_name = self.source.name if self.source.name else "ROOT"
-        self.workspace = self.source / f"{source_name}_{CONFIG['WORKSPACE_NAME']}"
+# =============================================================================
+# [DOMAIN] 領域層：靜態字串與提示訊息
+# =============================================================================
+class Strings:
+    TITLE_SRC = "【步驟 1/2】請選擇來源資料夾 (唯讀)"
+    TITLE_DST = "【步驟 2/2】請選擇輸出資料夾 (將在此建立整理結果)"
+    ERR_NO_PATH = "未提供有效路徑，程式終止。"
+    WARN_SPACE = "空間不足警告：目標磁碟至少需要 {req:.2f} MB"
+    REPORT_DRY_RUN = (
+        "\n--- [DRY RUN 掃描報告] ---\n"
+        "來源路徑: {src}\n"
+        "輸出路徑: {dst}\n"
+        "檔案總數: {count} 個\n"
+        "總計容量: {size:.2f} MB\n"
+        "輸出地剩餘空間: {free:.2f} MB\n"
+        "預估耗時: 約 {time:.1f} 分鐘\n"
+        "--------------------------\n"
+    )
+
+# =============================================================================
+# [ACTION] 基礎設施層：純粹的 I/O 操作 (無業務邏輯)
+# =============================================================================
+class FileAction:
+    @staticmethod
+    def safe_copy(src_path: Path, dst_path: Path) -> bool:
+        """安全複製檔案 (保留原始 metadata)"""
+        try:
+            shutil.copy2(src_path, dst_path)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def calculate_sha256(file_path: Path) -> str:
+        """計算檔案的 SHA-256 雜湊值"""
+        h = hashlib.sha256()
+        try:
+            with open(file_path, "rb") as f:
+                while chunk := f.read(CONFIG.BUFFER_SIZE):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def get_safe_filename(name: str) -> str:
+        """移除檔案名稱中不合法的字元"""
+        return re.sub(r'[\/:*?"<>|]', '_', name)
+
+    @staticmethod
+    def get_mtime_string(file_path: Path) -> str:
+        """取得檔案的最後修改日期字串 (YYYYMMDD)"""
+        try:
+            mtime = file_path.stat().st_mtime
+            return datetime.fromtimestamp(mtime).strftime("%Y%m%d")
+        except Exception:
+            return "UnknownDate"
+
+# =============================================================================
+# [FLOW] 邏輯層：核心業務流程控制
+# =============================================================================
+class DeduplicationFlow:
+    def __init__(self, src_dir: Path, dst_dir: Path):
+        self.src_dir = src_dir
+        self.dst_root = dst_dir
         
+        # 建立結構
         self.paths = {
-            "ROOT": self.workspace,
-            "UNIQUE": self.workspace / "1_Unique_Archive",
-            "DUPLICATES": self.workspace / "2_Duplicates_Isolation",
-            "FAILED": self.workspace / "TEMP_FAILED",
+            "temp": self.dst_root / CONFIG.DIR_TEMP,
+            "unique": self.dst_root / CONFIG.DIR_UNIQUE,
+            "dup": self.dst_root / CONFIG.DIR_DUPLICATE,
+            "failed": self.dst_root / CONFIG.DIR_FAILED
         }
-        
         for p in self.paths.values():
             p.mkdir(parents=True, exist_ok=True)
 
-        self.registry = {}    # 紀錄 {DNA: 首次出現的目標路徑}
-        self.report_data = [] # 結案報表數據
-        self.to_process = []
+        self.registry = set() # 記錄已處理的 Hash
+        self.report_data = [] # 結案報表資料
         self.stats = {"total": 0, "unique": 0, "dup": 0, "fail": 0}
-        self.start_time = time.time()
 
-    @staticmethod
-    def get_file_dna(path: Path):
-        """計算 DNA (SHA256)，實踐拒絕肉眼校對。"""
-        h = hashlib.sha256()
-        try:
-            if not path.exists(): return None
-            with open(path, "rb") as f:
-                while chunk := f.read(CONFIG["BUFFER_SIZE"]):
-                    h.update(chunk)
-            return h.hexdigest()
-        except: return None
+    def _generate_marked_name(self, original_path: Path, hash_val: str, status: str) -> str:
+        """產生帶有 Hash 與狀態標記的檔案名稱"""
+        clean_stem = FileAction.get_safe_filename(original_path.stem)[:50]
+        short_hash = hash_val[:CONFIG.HASH_LENGTH]
+        return f"{short_hash}_{clean_stem}_{status}{original_path.suffix}"
 
-    @staticmethod
-    def sanitize_name(name):
-        return re.sub(r'[\/:*?"<>|]', '_', name)
-
-    def _ui_choose_folder(self):
-        try:
-            root = tk.Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
-            folder = filedialog.askdirectory(title="【God Object 模式】請選擇清理目標")
-            root.destroy()
-            if not folder:
-                raw = input("請直接貼上資料夾路徑 (或按 Enter 退出): ").strip().replace('"', '')
-                folder = raw if raw else None
-            return Path(folder) if folder else None
-        except:
-            return None
-
-    def _pause_and_exit(self, code=0):
-        input("\n[程序終止] 按 Enter 鍵結束...")
-        sys.exit(code)
-
-    def preflight(self):
-        """Fail-Fast: 確保環境安全。"""
-        print(f"🔍 掃描來源：{self.source}")
-        
-        # 遍歷所有檔案，排除工作空間本身
-        try:
-            all_items = list(self.source.rglob('*'))
-        except Exception as e:
-            print(f"❌ 掃描失敗: {e}")
-            self._pause_and_exit(1)
-
-        self.to_process = [
-            f for f in all_items 
-            if f.is_file() and CONFIG['WORKSPACE_NAME'] not in str(f.resolve())
-        ]
-
-        if not self.to_process:
-            print("📭 沒有檔案需要處理。")
-            self._pause_and_exit(0)
-
-        total_size = sum(f.stat().st_size for f in self.to_process)
-        disk = shutil.disk_usage(self.source)
-        
-        print(f"📊 待處理: {len(self.to_process)} 檔案 | 體積: {total_size/1024/1024:.2f} MB")
-        if disk.free < total_size * 1.1:
-            print(f"🛑 空間不足！至少需要 {total_size*1.1/1024/1024:.2f} MB")
-            self._pause_and_exit(1)
-
-        confirm = input("⚠️ 確認執行複製與分類作業？(輸入 YES 執行): ").strip().upper()
-        if confirm != "YES":
-            self._pause_and_exit(0)
-
-    def generate_god_name(self, src: Path, sha_short: str, status: str, seq: int):
-        clean_stem = self.sanitize_name(src.stem[:CONFIG["MAX_STEM_LEN"]])
-        rev_tag = f"_REV{seq}" if seq > 0 else ""
-        name = f"DNA_{sha_short}_【{clean_stem}】_{status}{rev_tag}{src.suffix}"
-        # 處理極長路徑 Windows 限制
-        if len(name) > 150:
-            name = f"DNA_{sha_short}_S{seq}_{int(time.time())}{src.suffix}"
-        return name
-
-    def execute(self):
-        """核心執行邏輯：自動處理單層與多層結構。"""
-        for idx, src in enumerate(self.to_process, 1):
+    def process_files(self, file_list: list):
+        """Phase 1: 複製、計算 Hash、分類與標記"""
+        for idx, src_file in enumerate(file_list, 1):
             self.stats["total"] += 1
-            dna = self.get_file_dna(src)
             
-            if not dna:
-                self.handle_fail(src, "DNA_READ_ERROR")
+            # Step 1: 複製到暫存區 (完全隔離對原檔的依賴)
+            temp_file = self.paths["temp"] / src_file.name
+            if not FileAction.safe_copy(src_file, temp_file):
+                self._record_failure(src_file, "COPY_TO_TEMP_FAILED")
                 continue
 
-            sha_short = dna[:CONFIG["SHA_DISPLAY_LEN"]]
-            is_unique = dna not in self.registry
-            target_base = self.paths["UNIQUE"] if is_unique else self.paths["DUPLICATES"]
-            status_label = "UNIQUE" if is_unique else "DUP"
+            # Step 2: 針對暫存檔計算 Hash
+            hash_val = FileAction.calculate_sha256(temp_file)
+            if not hash_val:
+                self._record_failure(src_file, "HASH_CALCULATION_FAILED")
+                if temp_file.exists(): temp_file.unlink()
+                continue
 
-            # 【關鍵修復】處理單層資料夾路徑
+            # Step 3: 狀態判定與目錄映射
+            is_unique = hash_val not in self.registry
+            target_base = self.paths["unique"] if is_unique else self.paths["dup"]
+            status_tag = "UNIQUE" if is_unique else "DUP"
+            
             try:
-                rel_path = src.relative_to(self.source)
-                rel_parent = rel_path.parent
-                # 如果是單層檔案，rel_parent 會是 Path('.')，這在建立目錄時沒問題
-                full_target_dir = target_base / rel_parent
-                full_target_dir.mkdir(parents=True, exist_ok=True)
-            except Exception as e:
-                self.handle_fail(src, f"PATH_ERROR_{str(e)[:10]}")
-                continue
+                rel_path = src_file.relative_to(self.src_dir)
+                target_dir = target_base / rel_path.parent
+                target_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                target_dir = target_base
 
-            # 解決名稱衝突 (SSOT: 絕不覆蓋)
-            seq = 0
-            while True:
-                dst_name = self.generate_god_name(src, sha_short, status_label, seq)
-                dst = full_target_dir / dst_name
-                if not dst.exists(): break
-                seq += 1
+            # Step 4: 命名與移動 (避免覆寫)
+            marked_name = self._generate_marked_name(src_file, hash_val, status_tag)
+            final_dst = target_dir / marked_name
+            
+            counter = 1
+            while final_dst.exists():
+                final_dst = target_dir / f"{final_dst.stem}_REV{counter}{final_dst.suffix}"
+                counter += 1
 
-            # 執行複製與二重檢核
-            success = False
-            for _ in range(CONFIG["LOCK_RETRY_LIMIT"]):
-                try:
-                    shutil.copy2(src, dst)
-                    if self.get_file_dna(dst) == dna:
-                        success = True
-                        break
-                    else:
-                        if dst.exists(): dst.unlink()
-                except:
-                    time.sleep(0.5)
-
-            if not success:
-                self.handle_fail(src, "COPY_VERIFY_FAILED")
-            else:
+            try:
+                shutil.move(str(temp_file), str(final_dst))
                 if is_unique:
-                    self.registry[dna] = dst
+                    self.registry.add(hash_val)
                     self.stats["unique"] += 1
                 else:
                     self.stats["dup"] += 1
-                self.report_data.append([dst.name, sha_short, status_label, str(src)])
+                
+                self.report_data.append([final_dst.name, hash_val[:8], status_tag, str(src_file)])
+            except Exception as e:
+                self._record_failure(src_file, "MOVE_TO_FINAL_FAILED")
+                if temp_file.exists(): temp_file.unlink()
 
-            if idx % 10 == 0 or idx == len(self.to_process):
-                print(f"⚡ 進度: {idx}/{len(self.to_process)} (唯一:{self.stats['unique']} 重複:{self.stats['dup']})")
+            print(f"\r進度: {idx}/{len(file_list)} | 唯一: {self.stats['unique']} | 重複: {self.stats['dup']}", end="")
+        print()
 
-    def handle_fail(self, src: Path, reason: str):
+    def _record_failure(self, src_file: Path, reason: str):
+        """記錄處理失敗的項目"""
         self.stats["fail"] += 1
-        fn = f"ERR_{int(time.time())}_{self.sanitize_name(src.name)}"
-        print(f"❌ 處理失敗: {src.name} 原因: {reason}")
+        safe_name = FileAction.get_safe_filename(src_file.name)
+        fail_path = self.paths["failed"] / f"ERR_{int(time.time())}_{safe_name}.txt"
         try:
-            shutil.copy2(src, self.paths["FAILED"] / fn)
-        except:
+            with open(fail_path, "w", encoding="utf-8") as f:
+                f.write(f"Source: {src_file}\nReason: {reason}")
+        except Exception:
             pass
-        self.report_data.append([fn, "N/A", f"FAIL_{reason}", str(src)])
+        self.report_data.append([safe_name, "N/A", f"FAIL: {reason}", str(src_file)])
 
-    def finalize(self):
-        """結案報表與總結。"""
-        report_name = f"{self.source.name}_{CONFIG['REPORT_NAME']}"
-        report_path = self.workspace / report_name
+    def restore_filenames(self):
+        """Phase 2a: 移除 Unique 區檔案的標記，處理命名衝突"""
+        if not CONFIG.ENABLE_FILENAME_RESTORE:
+            return
 
+        print("\n[Phase 2a] 正在執行檔案名稱還原 (移除標記)...")
+        for root, _, files in os.walk(self.paths["unique"]):
+            current_dir = Path(root)
+            for file in files:
+                old_path = current_dir / file
+                
+                # 利用正則表達式剝離前綴(Hash)與後綴(_UNIQUE)
+                # 假設原檔名為 clean_stem，格式為 {Hash}_{clean_stem}_UNIQUE.ext
+                match = re.match(r'^[a-fA-F0-9]+_(.*)_UNIQUE(\.[a-zA-Z0-9]+)?$', file)
+                if not match:
+                    continue
+                
+                base_name = match.group(1)
+                extension = match.group(2) if match.group(2) else ""
+                new_name = f"{base_name}{extension}"
+                new_path = current_dir / new_name
+
+                # 衝突處理：加上 修改日期_浮水編號
+                if new_path.exists() and new_path != old_path:
+                    mtime_str = FileAction.get_mtime_string(old_path)
+                    counter = 1
+                    while True:
+                        new_name = f"{base_name}_{mtime_str}_{counter:02d}{extension}"
+                        new_path = current_dir / new_name
+                        if not new_path.exists():
+                            break
+                        counter += 1
+
+                try:
+                    old_path.rename(new_path)
+                except Exception as e:
+                    print(f"重新命名失敗: {old_path.name} -> {e}")
+
+    def flatten_sparse_directories(self):
+        """Phase 2b: 目錄扁平化 (由內而外拆除項目少於門檻的資料夾)"""
+        if not CONFIG.ENABLE_DIR_FLATTENING:
+            return
+
+        print("[Phase 2b] 正在執行資料夾扁平化 (清理空目錄或單一項目隧道)...")
+        
+        # 使用 bottom-up (topdown=False) 確保由最深層往上處理
+        for root, dirs, files in os.walk(self.paths["unique"], topdown=False):
+            current_dir = Path(root)
+            if current_dir == self.paths["unique"]:
+                continue # 不要更動 Unique 根目錄
+
+            items = list(current_dir.iterdir())
+            if len(items) < CONFIG.MIN_ITEMS_FOR_DIR:
+                parent_dir = current_dir.parent
+                
+                # 將僅存的項目往上層搬移
+                for item in items:
+                    target_path = parent_dir / item.name
+                    # 處理搬家時的命名衝突
+                    if target_path.exists():
+                        base = item.stem
+                        ext = item.suffix
+                        mtime_str = FileAction.get_mtime_string(item)
+                        counter = 1
+                        while target_path.exists():
+                            target_path = parent_dir / f"{base}_{mtime_str}_{counter:02d}{ext}"
+                            counter += 1
+                    try:
+                        shutil.move(str(item), str(target_path))
+                    except Exception:
+                        pass
+                
+                # 刪除已清空的目錄
+                try:
+                    current_dir.rmdir()
+                except Exception:
+                    pass
+
+    def generate_report(self):
+        """產生結案報告至目標資料夾"""
+        report_path = self.dst_root / CONFIG.REPORT_FILENAME
         try:
             with open(report_path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
-                writer.writerow(["最終名稱", "DNA短碼", "狀態", "原始路徑"])
+                writer.writerow(["處理後名稱", "SHA256_短碼", "分類狀態", "原始路徑"])
                 writer.writerows(self.report_data)
+            print(f"\n✅ 處理報告已儲存至: {report_path}")
+        except Exception:
+            print("\n❌ 處理報告儲存失敗。")
+
+    def clean_temp_dir(self):
+        """清理暫存資料夾"""
+        try:
+            if self.paths["temp"].exists():
+                shutil.rmtree(self.paths["temp"])
+        except Exception:
+            pass
+
+# =============================================================================
+# [RUTTER] 路由層：UI 互動與流程總管
+# =============================================================================
+class AppRouter:
+    @staticmethod
+    def get_folder_path(title: str) -> Path:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        folder = filedialog.askdirectory(title=title)
+        root.destroy()
+        return Path(folder) if folder else None
+
+    def run(self):
+        try:
+            # 1. 取得路徑
+            src_path = self.get_folder_path(Strings.TITLE_SRC)
+            if not src_path:
+                print(Strings.ERR_NO_PATH); return
+                
+            dst_path = self.get_folder_path(Strings.TITLE_DST)
+            if not dst_path:
+                print(Strings.ERR_NO_PATH); return
+
+            if src_path in dst_path.parents or src_path == dst_path:
+                print("❌ 輸出目錄不可位於來源目錄之中，以防無窮迴圈。程式終止。")
+                return
+
+            # 2. DRY RUN (掃描與空間計算)
+            print("\n正在掃描來源檔案...")
+            files = [f for f in src_path.rglob('*') if f.is_file()]
+            total_size_mb = sum(f.stat().st_size for f in files) / (1024 * 1024)
+            required_mb = total_size_mb * CONFIG.SAFE_SPACE_RATIO
+            free_space_mb = shutil.disk_usage(dst_path).free / (1024 * 1024)
+            estimated_time = total_size_mb / CONFIG.ESTIMATE_MB_PER_SEC / 60
+
+            print(Strings.REPORT_DRY_RUN.format(
+                src=src_path, dst=dst_path, count=len(files), 
+                size=total_size_mb, free=free_space_mb, time=estimated_time
+            ))
+
+            if free_space_mb < required_mb:
+                print(Strings.WARN_SPACE.format(req=required_mb))
+                return
+
+            confirm = input("確認開始執行作業？ (輸入 Y 繼續): ").strip().upper()
+            if confirm != "Y":
+                return
+
+            # 3. 執行核心流程
+            flow = DeduplicationFlow(src_path, dst_path)
+            try:
+                print("\n[Phase 1] 開始複製與雜湊分類作業...")
+                flow.process_files(files)
+                
+                # 根據 CONFIG 決定是否執行 Phase 2
+                flow.restore_filenames()
+                flow.flatten_sparse_directories()
+
+            except KeyboardInterrupt:
+                print("\n\n⚠️ 偵測到中斷訊號 (Ctrl+C)。正在停止處理並保存現有進度...")
+            finally:
+                # 4. 結算與清掃
+                flow.clean_temp_dir()
+                flow.generate_report()
+                print("\n作業結束。")
+                input("請按 Enter 鍵關閉視窗...")
+
         except Exception as e:
-            print(f"❌ 報表寫入失敗: {e}")
+            print(f"\n發生未預期錯誤:\n{traceback.format_exc()}")
+            input("請按 Enter 鍵關閉視窗...")
 
-        print("\n" + "═"*50)
-        print(f"✨ 任務完成！耗時: {time.time()-self.start_time:.2f}s")
-        print(f"✅ 唯一: {self.stats['unique']} | ⚠️ 重複: {self.stats['dup']} | ❌ 失敗: {self.stats['fail']}")
-        print(f"📄 CSV報表已產生: {report_path}")
-        self._pause_and_exit(0)
-
+# =============================================================================
+# 程式進入點
+# =============================================================================
 if __name__ == "__main__":
-    try:
-        app = GodCleanup()
-        app.preflight()
-        app.execute()
-        app.finalize()
-    except Exception as e: 
-        print(f"\n💥 致命錯誤:\n{traceback.format_exc()}")
-        input("\n請截圖上方錯誤訊息後，按 Enter 關閉...")
+    app = AppRouter()
+    app.run()
