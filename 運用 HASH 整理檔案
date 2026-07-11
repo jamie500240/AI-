@@ -1,11 +1,11 @@
 # ==========================================================
-# MODULE:       Script_GodCleanup_v2.1.3 (Strict Compliance Edition)
+# MODULE:       Script_GodCleanup_v2.1.4 (Final Edition)
 # PURPOSE:      檔案清理與去重自動化核心 (嚴格遵守 ACDS 合約)
 # EXPORTS:      Script_AppRouter.run()
 # IMPORTS:      os, shutil, hashlib, pathlib, datetime, tkinter, csv
 # FORBIDDEN:    上帝物件、跨層依賴、隱性轉型、靜默覆寫、未授權命名、靜默失敗
 # DEPENDENCIES: 作業系統檔案 I/O、Tkinter UI 環境
-# VERSION:      2.1.3 [Stability: Stable]
+# VERSION:      2.1.4 [Stability: Stable]
 #
 # [ADR-001] 關於 P0-11「全有或全無 (All-or-Nothing)」原則之豁免與取捨
 # Context:  本系統處理之目標可能高達數百 GB，搬運與雜湊計算耗時極長。
@@ -36,7 +36,8 @@ class cls_AppConfig:
     HASH_LENGTH: int = 16
     ESTIMATE_MB_PER_SEC: float = 50.0
     SAFE_SPACE_RATIO: float = 1.1
-    
+    LOCK_RETRY_LIMIT: int = 3  # I/O 驗證重試上限
+
     DIR_TEMP: str = "0_Temp_Sandbox"
     DIR_UNIQUE: str = "1_Unique_Archive"
     DIR_DUPLICATE: str = "2_Duplicates_Iso"
@@ -225,18 +226,37 @@ class Script_Archiver:
             self.state.stats["total"] += 1
             temp_file = self.paths["temp"] / src_file.name
             
-            if not Utils_FileSystem.safe_copy(src_file, temp_file):
-                Utils_Logger.log("ERROR", "Script_Archiver", f"複製至沙盒失敗: {src_file.name}")
-                self._record_fail(src_file, "COPY_FAILED")
+            # [P0-2] 1. 先取得真實的來源 DNA 作為基準
+            src_hash = Utils_FileSystem.calculate_sha256(src_file, self.config.BUFFER_SIZE)
+            if not src_hash:
+                Utils_Logger.log("ERROR", "Script_Archiver", f"來源 Hash 計算失敗，檔案可能被鎖定: {src_file.name}")
+                self._record_fail(src_file, "SRC_HASH_FAILED")
                 continue
 
-            hash_val = Utils_FileSystem.calculate_sha256(temp_file, self.config.BUFFER_SIZE)
-            if not hash_val:
-                Utils_Logger.log("ERROR", "Script_Archiver", f"Hash 計算失敗: {src_file.name}")
-                self._record_fail(src_file, "HASH_FAILED")
-                Utils_FileSystem.safe_unlink(temp_file)
+            # [P0-2] 2. 執行「複製與完整性驗證」的防禦性迴圈
+            copy_success = False
+            for attempt in range(self.config.LOCK_RETRY_LIMIT):
+                if not Utils_FileSystem.safe_copy(src_file, temp_file):
+                    time.sleep(0.5)
+                    continue
+                
+                # 對複製品進行 DNA 採樣並比對
+                temp_hash = Utils_FileSystem.calculate_sha256(temp_file, self.config.BUFFER_SIZE)
+                if temp_hash == src_hash:
+                    copy_success = True
+                    break
+                else:
+                    Utils_Logger.log("WARN", "Script_Archiver", f"完整性驗證失敗，進行重試 ({attempt+1}/{self.config.LOCK_RETRY_LIMIT}): {src_file.name}")
+                    Utils_FileSystem.safe_unlink(temp_file)
+                    time.sleep(0.5)
+
+            if not copy_success:
+                Utils_Logger.log("ERROR", "Script_Archiver", f"超過重試次數，複製或驗證徹底失敗: {src_file.name}")
+                self._record_fail(src_file, "COPY_VERIFY_FAILED")
                 continue
 
+            # 3. 判定分類與生成目標目錄
+            hash_val = src_hash 
             is_unique = hash_val not in self.state.registry
             base_dir = self.paths["unique"] if is_unique else self.paths["dup"]
             status_tag = "UNIQUE" if is_unique else "DUP"
@@ -288,8 +308,6 @@ class Script_Renamer:
     def __init__(self, config: cls_AppConfig, unique_dir: Path):
         self.config = config
         self.unique_dir = unique_dir
-        # [修復] 將匹配字元精準綁定 CONFIG.HASH_LENGTH，以 (\..*)? 防禦任何特殊後綴
-        # 即使原始檔名本身帶有 _UNIQUE 字樣，也不會被貪婪匹配錯殺
         self.pattern = re.compile(rf'^([a-fA-F0-9]{{{self.config.HASH_LENGTH}}})_(.*)_UNIQUE(\..*)?$')
 
     def execute(self):
