@@ -1,11 +1,11 @@
 # ==========================================================
-# MODULE:       Script_ArchiveAudit_v1.0.3
+# MODULE:       Script_ArchiveAudit_v1.0.4
 # PURPOSE:      比對原始資料夾與歸檔資料夾之內容，依據 Hash 驗證是否遺漏或撞名。
 # EXPORTS:      RunApp()
 # IMPORTS:      hashlib, csv, os, datetime, pathlib, collections.defaultdict
 # FORBIDDEN:    禁止靜默忽略無法讀取的檔案；禁止直接移動或刪除任何檔案。
 # DEPENDENCIES: 本機 IO 權限; [Schema] REPORT_PREFIX, CSV_HEADERS
-# VERSION:      1.0.3 [Stability: Stable]
+# VERSION:      1.0.4 [Stability: Stable]
 # ==========================================================
 
 import hashlib
@@ -19,6 +19,7 @@ from collections import defaultdict
 # [SSOT] 配置與字串字典 (Config & String)
 # ==========================================
 class cls_Config:
+    REPORT_DIR_NAME = "Audit_Reports"            # [P4 修復] 獨立審計輸出目錄
     REPORT_PREFIX = "Archive_Verification_Report"
     HASH_ALGO = "sha256"
     CHUNK_SIZE = 16384       # 16KB 讀取緩衝
@@ -110,9 +111,14 @@ class cls_ScannerService:
     @staticmethod
     def scan_to_dict(base_path: Path, module_name: str) -> dict:
         data = defaultdict(list)
-        all_files = [f for f in base_path.rglob("*") if f.is_file()]
-        total = len(all_files)
         
+        # [P4 修復] 防禦性過濾：嚴格排除報表檔案 (副檔名 + 前綴)
+        all_files = [
+            f for f in base_path.rglob("*") 
+            if f.is_file() and not (f.name.startswith(cls_Config.REPORT_PREFIX) and f.suffix.lower() == ".csv")
+        ]
+        
+        total = len(all_files)
         cls_Logger.info(module_name, f"開始掃描，共計 {total} 個檔案。")
         for count, f in enumerate(all_files, start=1):
             f_hash = cls_FileInfra.calculate_hash(f)
@@ -178,7 +184,7 @@ class cls_MainController:
                 writer = csv.writer(f)
                 writer.writerow(cls_StringRegistry.CSV_HEADERS)
                 writer.writerows(rows)
-            cls_Logger.info("報表輸出", f"報告已成功寫入: {report_path.name}")
+            cls_Logger.info("報表輸出", f"報告已成功寫入: {report_path}")
         except Exception as e:
             raise InfraException(f"報表寫入失敗: {e}")
 
@@ -196,9 +202,13 @@ class cls_MainController:
             archive_dir = cls_PathRule.validate_directory(dir_a_str)
             cls_PathRule.validate_cross_directories(origin_dir, archive_dir)
             
+            # [P4 修復] 結構隔離：確保所有審計報告輸出至獨立資料夾
+            report_dir = Path.cwd() / cls_Config.REPORT_DIR_NAME
+            report_dir.mkdir(parents=True, exist_ok=True)
+            
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             report_filename = f"{cls_Config.REPORT_PREFIX}_{timestamp}.csv"
-            report_path = origin_dir.parent / report_filename
+            report_path = report_dir / report_filename
 
             origin_map = cls_ScannerService.scan_to_dict(origin_dir, "原始資料夾掃描")
             archive_map = cls_ScannerService.scan_to_dict(archive_dir, "歸檔資料夾掃描")
