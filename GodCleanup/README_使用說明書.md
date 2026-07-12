@@ -90,3 +90,5 @@
 如果您用記事本（或程式碼編輯器）打開這個 `.py` 檔案，在最上方的 `[SET] 領域層` 中，您可以透過修改 `True` / `False` 來改變系統行為：
 * `ENABLE_FILENAME_RESTORE = True` (改為 False 則唯一區的檔案將保留 DNA 印記)
 * `ENABLE_DIR_FLATTENING = True` (改為 False 則不自動拆除單一檔案的資料夾)
+
+## 注意：檔名超過 50 字被截短
