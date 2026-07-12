@@ -1,11 +1,11 @@
 # ==========================================================
-# MODULE:       Script_ArchiveAudit_v1.0.2
+# MODULE:       Script_ArchiveAudit_v1.0.3
 # PURPOSE:      比對原始資料夾與歸檔資料夾之內容，依據 Hash 驗證是否遺漏或撞名。
 # EXPORTS:      RunApp()
 # IMPORTS:      hashlib, csv, os, datetime, pathlib, collections.defaultdict
 # FORBIDDEN:    禁止靜默忽略無法讀取的檔案；禁止直接移動或刪除任何檔案。
 # DEPENDENCIES: 本機 IO 權限; [Schema] REPORT_PREFIX, CSV_HEADERS
-# VERSION:      1.0.2 [Stability: Stable]
+# VERSION:      1.0.3 [Stability: Stable]
 # ==========================================================
 
 import hashlib
@@ -26,18 +26,13 @@ class cls_Config:
     PROGRESS_INTERVAL = 20
 
 class cls_StringRegistry:
-    # UI 與日誌訊息
     APP_TITLE = "【ACDS v2.1 檔案歸檔審計系統】"
     PROMPT_ORIGIN = "1. 請輸入【原始資料夾】路徑: "
     PROMPT_ARCHIVE = "2. 請輸入【歸檔後資料夾】路徑: "
-    
-    # 報錯文字 (Fail-Fast)
     ERR_PATH_NOT_EXIST = "路徑不存在: {path}"
     ERR_NOT_A_DIR = "路徑不是一個資料夾: {path}"
     ERR_NESTED_DIR = "安全阻斷：原始與歸檔資料夾不可相同或互相包含 (巢狀目錄)"
     ERR_READ_FILE = "無法讀取檔案 (權限或鎖定問題): {path}"
-    
-    # CSV 報表合約 (Schema)
     CSV_HEADERS = ["Hash 指紋 (縮寫)", "比對結果", "原始檔名", "歸檔後檔名"]
     STAT_MATCH = "✅ 內容一致"
     STAT_OPTIMIZED = "💎 內容一致 (檔名優化)"
@@ -58,7 +53,6 @@ class cls_Logger:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         plain_msg = f"[{level}] {now} {module} {msg}"
         print(f"{color}{plain_msg}{cls_Logger.C_END}")
-        
         try:
             with open(cls_Logger.LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(plain_msg + "\n")
@@ -91,7 +85,6 @@ class cls_PathRule:
 
     @staticmethod
     def validate_cross_directories(dir_o: Path, dir_a: Path):
-        """[P4 修正] 防呆：檢查兩個目錄是否互相包含，防止掃描互相汙染"""
         if dir_o == dir_a or dir_o in dir_a.parents or dir_a in dir_o.parents:
             raise DomainRuleException(cls_StringRegistry.ERR_NESTED_DIR)
 
@@ -117,7 +110,7 @@ class cls_ScannerService:
     @staticmethod
     def scan_to_dict(base_path: Path, module_name: str) -> dict:
         data = defaultdict(list)
-        all_files = [f for f in base_path.rglob("*") if f.is_file() and not f.name.startswith(cls_Config.REPORT_PREFIX)]
+        all_files = [f for f in base_path.rglob("*") if f.is_file()]
         total = len(all_files)
         
         cls_Logger.info(module_name, f"開始掃描，共計 {total} 個檔案。")
@@ -140,33 +133,32 @@ class cls_AuditService:
         self.report_rows = []
 
     def run_comparison(self):
-        """[P1 修正] 使用 1 對 1 配對 (zip 邏輯)，取代笛卡兒積，解決重複檔案導致的數據膨脹"""
         all_hashes = set(self.origin_map.keys()) | set(self.archive_map.keys())
         
         for h in sorted(all_hashes):
-            orig_files = self.origin_map.get(h, [])
-            arch_files = self.archive_map.get(h, [])
+            orig_files = list(self.origin_map.get(h, []))
+            arch_files = list(self.archive_map.get(h, []))
 
-            # 1. 計算兩邊皆有的配對數量 (取最小值)
+            # 優先配對檔名完全相同者 -> Match
+            common = sorted(set(orig_files) & set(arch_files))
+            for name in common:
+                orig_files.remove(name)
+                arch_files.remove(name)
+                self.stats["match"] += 1
+                self.report_rows.append([h[:8], cls_StringRegistry.STAT_MATCH, name, name])
+
+            # 剩餘者按排序後位置配對 -> Optimized
             paired_count = min(len(orig_files), len(arch_files))
-            
-            # 2. 處理成功配對的部分 (Match 或 Optimized)
+            orig_files.sort()
+            arch_files.sort()
             for i in range(paired_count):
-                o, a = orig_files[i], arch_files[i]
-                if o == a:
-                    status = cls_StringRegistry.STAT_MATCH
-                    self.stats["match"] += 1
-                else:
-                    status = cls_StringRegistry.STAT_OPTIMIZED
-                    self.stats["optimized"] += 1
-                self.report_rows.append([h[:8], status, o, a])
-            
-            # 3. 處理原始資料夾多出來的檔案 (Missing)
+                self.stats["optimized"] += 1
+                self.report_rows.append([h[:8], cls_StringRegistry.STAT_OPTIMIZED, orig_files[i], arch_files[i]])
+
+            # 處理未配對的剩餘項目 -> Missing / New
             for i in range(paired_count, len(orig_files)):
                 self.stats["missing"] += 1
                 self.report_rows.append([h[:8], cls_StringRegistry.STAT_MISSING, orig_files[i], cls_StringRegistry.EMPTY_MARK])
-
-            # 4. 處理歸檔資料夾多出來的檔案 (New)
             for i in range(paired_count, len(arch_files)):
                 self.stats["new"] += 1
                 self.report_rows.append([h[:8], cls_StringRegistry.STAT_NEW, cls_StringRegistry.EMPTY_MARK, arch_files[i]])
@@ -200,29 +192,23 @@ class cls_MainController:
         print("-" * 50)
 
         try:
-            # 1. 規則驗證 (Fail-Fast)
             origin_dir = cls_PathRule.validate_directory(dir_o_str)
             archive_dir = cls_PathRule.validate_directory(dir_a_str)
-            cls_PathRule.validate_cross_directories(origin_dir, archive_dir) # 巢狀防呆
+            cls_PathRule.validate_cross_directories(origin_dir, archive_dir)
             
-            # [P4 修正] 動態產生報表檔名，加上 Timestamp 防止覆寫
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             report_filename = f"{cls_Config.REPORT_PREFIX}_{timestamp}.csv"
             report_path = origin_dir.parent / report_filename
 
-            # 2. 執行掃描
             origin_map = cls_ScannerService.scan_to_dict(origin_dir, "原始資料夾掃描")
             archive_map = cls_ScannerService.scan_to_dict(archive_dir, "歸檔資料夾掃描")
 
-            # 3. 領域邏輯比對
             cls_Logger.info(cls_MainController.MODULE_NAME, "開始進行 DNA 雜湊比對...")
             audit_svc = cls_AuditService(origin_map, archive_map)
             stats, report_rows = audit_svc.run_comparison()
 
-            # 4. 寫入報表
             cls_MainController.export_csv(report_path, report_rows)
 
-            # 5. 結果總結
             print("\n" + "="*50)
             if stats["missing"] > 0:
                 cls_Logger.crit("審計結果", f"警告！發現 {stats['missing']} 個檔案遺漏！")
