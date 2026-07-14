@@ -1,15 +1,15 @@
 # ==========================================================
-# MODULE:       Script_VBAHistorySequencer_1.0.0 [Stability: Experimental]
+# MODULE:       Script_VBAHistorySequencer
 # PURPOSE:      VBA 歷史版本分析與模組血緣追蹤
-# EXPORTS:      Script_AppRouter.run()
-# IMPORTS:      os, shutil, hashlib, pathlib, datetime, tkinter, csv
+# EXPORTS:      Pipeline.run()
+# IMPORTS:      os, sys, shutil, hashlib, pathlib, datetime, tkinter, csv, zipfile
 # FORBIDDEN:    上帝物件、跨層依賴、隱性轉型、靜默覆寫、未授權命名、靜默失敗
 # DEPENDENCIES: 作業系統檔案 I/O、Tkinter UI 環境
-# VERSION:      1.0.0 [Stability: Experimental]
+# VERSION:      1.1.0 [Stability: Experimental]
 #
 # [ADR-001] 關於 P0-11「全有或全無 (All-or-Nothing)」原則之豁免與取捨
 # Context:  本系統處理之目標可能高達數百 GB，搬運與雜湊計算耗時極長。
-# Decision: 遭遇 Ctrl+C (KeyboardInterrupt) 時，不執行「全數退回 (Rollback)」，而是保留已處理之檔案並產出結算報表。
+# Decision: 遭遇 Ctrl+C (KeyboardInterrupt) 或單一檔案 I/O 異常時，不執行「全數退回 (Rollback)」，而是保留已處理之檔案並產出結算報表。
 # Rationale:在巨量檔案處理情境下，銷毀數小時的成功進度會造成極差的 UX。保留 Partial State 並透過 CSV 報表確保資料狀態具備完全的可稽核性，為此情境下之最佳實務。
 # ==========================================================
 
@@ -20,26 +20,13 @@ import hashlib
 import csv
 import re
 import uuid
-import difflib
+import zipfile
 from time import time, sleep
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
-
-# ==========================================
-# 0. 環境依賴防禦與動態引擎掛載 (Fail-Fast & Graceful Degradation)
-# ==========================================
-try:
-    from oletools.olevba import VBA_Parser
-except ImportError:
-    raise RuntimeError("【環境錯誤】缺少二進位解析套件。請執行: pip install oletools")
-
-try:
-    from rapidfuzz import fuzz
-    HAS_RAPIDFUZZ = True
-except ImportError:
-    HAS_RAPIDFUZZ = False
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 # ==========================================
 # 1. ENCAPSULATED CONFIGS & STRINGS (SSOT)
@@ -50,6 +37,13 @@ class AppConfig:
     EXCEL_EXTS: tuple = ('.xls', '.xlsx', '.xlsm', '.xlsb')
     ILLEGAL_CHAR_PATTERN: str = r'[\\/*?:"<>|]'
     RESERVED_NAMES_PATTERN: str = r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$'
+    
+    # 【統一管理的防禦與效能閾值】
+    MAX_WORKERS: int = 4
+    TIMEOUT_ANCHOR_SEC: float = 15.0
+    TIMEOUT_PER_FILE_SEC: float = 10.0
+    MAX_LEGACY_XLS_MB: float = 20.0
+    MAX_VBA_CODE_LENGTH: int = 2 * 1024 * 1024  # 2MB 字元上限 (防止 OOM)
 
 @dataclass(frozen=True)
 class AppStrings:
@@ -67,7 +61,22 @@ class AppStrings:
     PREFIX_DUP: str = "[DUP]"
 
 # ==========================================
-# 2. DOMAIN MODELS & DTO
+# 2. 環境依賴防禦與動態引擎掛載 (Fail-Fast)
+# ==========================================
+try:
+    from oletools.olevba import VBA_Parser
+except ImportError:
+    raise RuntimeError("【環境錯誤】缺少二進位解析套件。請執行: pip install oletools")
+
+try:
+    from rapidfuzz import fuzz
+    HAS_RAPIDFUZZ = True
+except ImportError:
+    import difflib
+    HAS_RAPIDFUZZ = False
+
+# ==========================================
+# 3. DOMAIN MODELS & DTO
 # ==========================================
 @dataclass
 class EvolutionNode:
@@ -76,39 +85,29 @@ class EvolutionNode:
     error_msg: str = ""
     module_names: list[str] = field(default_factory=list)
     module_hashes: dict = field(default_factory=dict)
+    modules_code: dict = field(default_factory=dict) 
     similarity_score: float = 0.0
     generation: int = 0
     folder_name: str = ""
     is_clone: bool = False
 
 @dataclass
-class ReportRecord:
-    generation: str
-    source_excel: str
-    similarity_score: str
-    module_name: str
-    dna_short: str
-    status: str
-    details: str = ""
-
-@dataclass
 class ProcessPayload:
     source_dir: Path
+    output_dir: Path = None  # 新增輸出目錄欄位
     anchor_file: Path = None
     config: AppConfig = field(default_factory=AppConfig)
     strings: AppStrings = field(default_factory=AppStrings)
     
-    # 【核心重構：嚴格區分暫存區與最終定案區】
     staging_dir: Path = None
     final_dir: Path = None
     
     nodes: list[EvolutionNode] = field(default_factory=list)
     anchor_modules: dict = field(default_factory=dict)
-    report_data: list[ReportRecord] = field(default_factory=list)
     stats: dict = field(default_factory=lambda: {"mutations": 0, "inherited": 0, "clones": 0, "failed": 0})
 
 # ==========================================
-# 3. UTILITY 
+# 4. UTILITY 
 # ==========================================
 class Sanitizer:
     @staticmethod
@@ -132,8 +131,7 @@ class SimilarityEngine:
             code_t = target_mods.get(name, "")
             weight = max(len(code_a), len(code_t))
             
-            if weight == 0:
-                continue
+            if weight == 0: continue
                 
             if code_a == code_t:
                 ratio = 1.0
@@ -150,10 +148,38 @@ class SimilarityEngine:
 
 class VbaExtractor:
     @staticmethod
-    def extract(file_path: Path) -> tuple[bool, dict, dict, str]:
+    def extract(file_path: Path, config: AppConfig) -> tuple[bool, dict, dict, str]:
         modules, hashes = {}, {}
         vba_parser = None
+        suffix = file_path.suffix.lower()
+        
+        if suffix in ('.xlsm', '.xlsb', '.xlsx'):
+            try:
+                with zipfile.ZipFile(file_path, 'r') as z:
+                    vba_target = next((name for name in z.namelist() if name.lower().endswith('vbaproject.bin')), None)
+                    if vba_target:
+                        with z.open(vba_target) as vba_bin:
+                            vba_data = vba_bin.read() 
+                        
+                        vba_parser = VBA_Parser(file_path.name, data=vba_data)
+                        if vba_parser.detect_vba_macros():
+                            for (_, _, vba_filename, vba_code) in vba_parser.extract_macros():
+                                if vba_code and vba_code.strip():
+                                    modules[vba_filename] = vba_code
+                                    hashes[vba_filename] = hashlib.sha256(vba_code.encode('utf-8', errors='ignore')).hexdigest()
+                        return True, modules, hashes, ""
+            except Exception as e:
+                return False, {}, {}, f"ZIP Extract Failed: {e}"
+            finally:
+                if vba_parser:
+                    try: vba_parser.close()
+                    except: pass
+
         try:
+            file_size_mb = file_path.stat().st_size / (1024 * 1024)
+            if suffix == '.xls' and file_size_mb > config.MAX_LEGACY_XLS_MB:
+                return False, {}, {}, f"Legacy .xls file too large ({file_size_mb:.1f}MB). Skipped to protect memory."
+
             with open(file_path, 'rb') as f:
                 file_bytes = f.read()
             vba_parser = VBA_Parser(file_path.name, data=file_bytes)
@@ -171,7 +197,7 @@ class VbaExtractor:
                 except: pass
 
 # ==========================================
-# 4. ACTIONS (PIPELINE)
+# 5. ACTIONS (PIPELINE)
 # ==========================================
 class IAction(ABC):
     @abstractmethod
@@ -187,29 +213,50 @@ class ActionPreScanAndSequence(IAction):
         if not target_files:
             raise ValueError("找不到任何 Excel 檔案。")
 
-        # 解析 Anchor
-        is_valid, payload.anchor_modules, _, err = VbaExtractor.extract(payload.anchor_file)
+        print("🔍 正在解析錨點檔案...")
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(VbaExtractor.extract, payload.anchor_file, payload.config)
+            try:
+                is_valid, payload.anchor_modules, _, err = future.result(timeout=payload.config.TIMEOUT_ANCHOR_SEC)
+            except TimeoutError:
+                raise RuntimeError("⚠️ 錨點檔案解析超時！該檔案可能損壞或過於巨大。")
+
         if not is_valid or not payload.anchor_modules:
             raise RuntimeError(f"⚠️ 錨點解析失敗或無巨集：{err}")
 
-        # 第一階段掃描：不儲存 code_string，僅存 Metadata 避免 OOM
-        for idx, f_path in enumerate(target_files, 1):
-            is_valid, modules, hashes, err = VbaExtractor.extract(f_path)
+        executor = ThreadPoolExecutor(max_workers=payload.config.MAX_WORKERS)
+        futures = [(f_path, executor.submit(VbaExtractor.extract, f_path, payload.config)) for f_path in target_files]
+
+        for idx, (f_path, future) in enumerate(futures, 1):
+            sys.stdout.write(f"\r🔍 基因掃描中 (併發解析): {idx} / {len(target_files)}")
+            sys.stdout.flush()
+            
+            try:
+                is_valid, modules, hashes, err = future.result(timeout=payload.config.TIMEOUT_PER_FILE_SEC)
+            except TimeoutError:
+                is_valid, modules, hashes, err = False, {}, {}, f"Parser Timeout (> {payload.config.TIMEOUT_PER_FILE_SEC}s)"
+            except Exception as ex:
+                is_valid, modules, hashes, err = False, {}, {}, f"Thread Error: {ex}"
+            
             node = EvolutionNode(
                 file_path=f_path, is_valid=is_valid, error_msg=err, 
-                module_names=list(modules.keys()), module_hashes=hashes
+                module_names=list(modules.keys()), module_hashes=hashes, modules_code=modules
             )
             
             if is_valid:
-                node.similarity_score = SimilarityEngine.calculate_weighted_ratio(payload.anchor_modules, modules)
+                total_char_len = sum(len(v) for v in modules.values())
+                if total_char_len > payload.config.MAX_VBA_CODE_LENGTH:
+                    node.is_valid = False
+                    node.error_msg = f"VBA code size too massive ({total_char_len} chars), bypassed."
+                    node.modules_code = {} 
+                else:
+                    node.similarity_score = SimilarityEngine.calculate_weighted_ratio(payload.anchor_modules, modules)
             
             payload.nodes.append(node)
-            sys.stdout.write(f"\r🔍 基因掃描中 (Low-Memory Mode): {idx} / {len(target_files)}")
-            sys.stdout.flush()
-            
+        
+        executor.shutdown(wait=False)
         print("\n✅ 比對完成。")
 
-        # 排序與賦名
         valid_nodes = [n for n in payload.nodes if n.is_valid]
         valid_nodes.sort(key=lambda n: (n.similarity_score, len(n.module_names)))
         
@@ -222,16 +269,17 @@ class ActionPreScanAndSequence(IAction):
 
 class ActionInitializeWorkspace(IAction):
     def execute(self, payload: ProcessPayload) -> ProcessPayload:
-        python_base_dir = Path(__file__).resolve().parent if '__file__' in globals() else Path.cwd()
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
-        payload.final_dir = python_base_dir / f"{payload.strings.DIR_WORKSPACE_PREFIX}_{timestamp}"
-        payload.staging_dir = python_base_dir / f"{payload.strings.DIR_STAGE_PREFIX}_{timestamp}"
+        # 依賴使用者指定的輸出目錄，不再污染 __file__ 所在目錄
+        base_dir = payload.output_dir if payload.output_dir else Path.cwd()
+        
+        payload.final_dir = base_dir / f"{payload.strings.DIR_WORKSPACE_PREFIX}_{timestamp}"
+        payload.staging_dir = base_dir / f"{payload.strings.DIR_STAGE_PREFIX}_{timestamp}"
         
         if payload.final_dir.exists() or payload.staging_dir.exists():
-            raise RuntimeError("發生資料夾名稱碰撞，請一秒後再試。")
+            raise RuntimeError("發生資料夾名稱碰撞，請稍後再試。")
             
-        # 僅在 Staging 區建立結構，Final 區留待最後 Commit 時再生成
         payload.staging_dir.mkdir(parents=True, exist_ok=False)
         (payload.staging_dir / payload.strings.DIR_CLONES).mkdir(parents=True, exist_ok=False)
         (payload.staging_dir / payload.strings.DIR_FAILED).mkdir(parents=True, exist_ok=False)
@@ -239,101 +287,99 @@ class ActionInitializeWorkspace(IAction):
 
 class ActionExtractAndStage(IAction):
     def execute(self, payload: ProcessPayload) -> ProcessPayload:
-        print("\n🏗️ [階段 2/4] 啟動隔離 Staging 區間建置與實體檔案寫入...")
+        print("\n🏗️ [階段 2/4 & 3/4] 啟動隔離區間實體寫入與流式報表生成...")
         
         global_hash_registry = set()
         global_genome_registry = set()
         sorted_nodes = sorted(payload.nodes, key=lambda n: n.generation)
         
-        for node in sorted_nodes:
-            safe_excel_name = Sanitizer.clean_filename(node.file_path.name, payload.config)
-            
-            # 處理失效檔案
-            if not node.is_valid:
-                payload.stats["failed"] += 1
-                shutil.copy2(node.file_path, payload.staging_dir / payload.strings.DIR_FAILED / node.file_path.name)
-                payload.report_data.append(ReportRecord(
-                    generation="N/A", source_excel=safe_excel_name, similarity_score="N/A",
-                    module_name="N/A", dna_short="N/A", status=payload.strings.STATUS_FAIL, details=node.error_msg
-                ))
-                continue
-                
-            # 處理純複製體
-            file_genome = frozenset(node.module_hashes.values())
-            if file_genome in global_genome_registry and file_genome:
-                node.is_clone = True
-                payload.stats["clones"] += 1
-                shutil.copy2(node.file_path, payload.staging_dir / payload.strings.DIR_CLONES / node.file_path.name)
-                payload.report_data.append(ReportRecord(
-                    generation=str(node.generation), source_excel=safe_excel_name, similarity_score=f"{node.similarity_score:.1f}%",
-                    module_name="[ALL_MODULES]", dna_short="N/A", status=payload.strings.STATUS_CLONE,
-                    details="100% 基因重疊，已下放 CLONES 隔離區"
-                ))
-                continue
-                
-            global_genome_registry.add(file_genome)
-            
-            # 【Time-Space Tradeoff】針對有效的變異節點進行二次提取
-            _, current_modules, _, _ = VbaExtractor.extract(node.file_path)
-            
-            node_target_dir = payload.staging_dir / node.folder_name
-            node_target_dir.mkdir(parents=True, exist_ok=True)
-            
-            # 【效能優化】順便把原版 Excel 備份進 Staging 節點區
-            shutil.copy2(node.file_path, node_target_dir / node.file_path.name)
-            
-            for vba_filename, vba_code in current_modules.items():
-                dna = node.module_hashes.get(vba_filename, "")
-                if not dna: continue
-                
-                sha_short = dna[:payload.config.SHA_LEN]
-                safe_mod_name = Sanitizer.clean_filename(vba_filename, payload.config)
-                
-                is_mutation = dna not in global_hash_registry
-                global_hash_registry.add(dna)
-                
-                if is_mutation:
-                    status = payload.strings.STATUS_UNIQUE
-                    payload.stats["mutations"] += 1
-                    # 突變模組直接寫入最終檔名 (無前綴)
-                    final_mod_name = f"{safe_mod_name}_{sha_short}.txt"
-                else:
-                    status = payload.strings.STATUS_DUP
-                    payload.stats["inherited"] += 1
-                    # 繼承模組加上 DUP 前綴
-                    final_mod_name = f"{payload.strings.PREFIX_DUP}_{safe_mod_name}_{sha_short}.txt"
-                
-                with open(node_target_dir / final_mod_name, "w", encoding="utf-8") as out_f:
-                    out_f.write(vba_code)
-                    
-                payload.report_data.append(ReportRecord(
-                    generation=str(node.generation), source_excel=safe_excel_name, similarity_score=f"{node.similarity_score:.1f}%",
-                    module_name=safe_mod_name, dna_short=sha_short, status=status
-                ))
-                
-        # 產生 CSV 報表 (寫入 Staging)
-        print("📄 [階段 3/4] 產生血緣演化報表...")
         report_path = payload.staging_dir / payload.strings.REPORT_FILE
+        
         with open(report_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(["世代(Gen)", "相似度", "來源檔案", "模組名稱", "DNA碼", "演化狀態", "備註"])
-            for record in reversed(payload.report_data):
-                writer.writerow([
-                    record.generation, record.similarity_score, record.source_excel, 
-                    record.module_name, record.dna_short, record.status, record.details
-                ])
+            csv_writer = csv.writer(f)
+            csv_writer.writerow(["世代(Gen)", "相似度", "來源檔案", "模組名稱", "DNA碼", "演化狀態", "備註"])
+            
+            for node in sorted_nodes:
+                try:
+                    safe_excel_name = Sanitizer.clean_filename(node.file_path.name, payload.config)
+                    
+                    if not node.is_valid:
+                        payload.stats["failed"] += 1
+                        try:
+                            shutil.copy2(node.file_path, payload.staging_dir / payload.strings.DIR_FAILED / node.file_path.name)
+                        except Exception as copy_err:
+                            node.error_msg += f" (I/O Error: {copy_err})"
+                        
+                        csv_writer.writerow(["N/A", "N/A", safe_excel_name, "N/A", "N/A", payload.strings.STATUS_FAIL, node.error_msg])
+                        f.flush()
+                        continue
+                        
+                    file_genome = frozenset(node.module_hashes.values())
+                    if file_genome in global_genome_registry and file_genome:
+                        node.is_clone = True
+                        payload.stats["clones"] += 1
+                        shutil.copy2(node.file_path, payload.staging_dir / payload.strings.DIR_CLONES / node.file_path.name)
+                        csv_writer.writerow([str(node.generation), f"{node.similarity_score:.1f}%", safe_excel_name, "[ALL_MODULES]", "N/A", payload.strings.STATUS_CLONE, "100% 基因重疊，已下放 CLONES 隔離區"])
+                        f.flush()
+                        continue
+                        
+                    global_genome_registry.add(file_genome)
+                    current_modules = node.modules_code 
+                    
+                    node_target_dir = payload.staging_dir / node.folder_name
+                    node_target_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(node.file_path, node_target_dir / node.file_path.name)
+                    
+                    for vba_filename, vba_code in current_modules.items():
+                        dna = node.module_hashes.get(vba_filename, "")
+                        if not dna: continue
+                        
+                        sha_short = dna[:payload.config.SHA_LEN]
+                        safe_mod_name = Sanitizer.clean_filename(vba_filename, payload.config)
+                        
+                        is_mutation = dna not in global_hash_registry
+                        global_hash_registry.add(dna)
+                        
+                        if is_mutation:
+                            status = payload.strings.STATUS_UNIQUE
+                            payload.stats["mutations"] += 1
+                            final_mod_name = f"{safe_mod_name}_{sha_short}.txt"
+                        else:
+                            status = payload.strings.STATUS_DUP
+                            payload.stats["inherited"] += 1
+                            final_mod_name = f"{payload.strings.PREFIX_DUP}_{safe_mod_name}_{sha_short}.txt"
+                        
+                        with open(node_target_dir / final_mod_name, "w", encoding="utf-8") as out_f:
+                            out_f.write(vba_code)
+                            
+                        csv_writer.writerow([str(node.generation), f"{node.similarity_score:.1f}%", safe_excel_name, safe_mod_name, sha_short, status, ""])
+                    
+                    f.flush()
                 
+                except Exception as file_io_err:
+                    payload.stats["failed"] += 1
+                    fallback_excel_name = str(node.file_path.name) if node.file_path else "UNKNOWN_FILE"
+                    
+                    err_str = f"檔案處理異常 ({type(file_io_err).__name__}): {file_io_err}"
+                    csv_writer.writerow([str(node.generation), f"{node.similarity_score:.1f}%", fallback_excel_name, "N/A", "N/A", payload.strings.STATUS_FAIL, err_str])
+                    f.flush()
+                    
+                    try:
+                        shutil.copy2(node.file_path, payload.staging_dir / payload.strings.DIR_FAILED / node.file_path.name)
+                    except:
+                        pass
+                    continue
+                    
         return payload
 
 class ActionCommitAndFinalize(IAction):
     def execute(self, payload: ProcessPayload) -> ProcessPayload:
         print("\n🔒 [階段 4/4] Atomic Operation: 執行 O(1) 終極更名提交 (Two-Phase Commit)...")
-        # 作業系統層級的指標抽換。一旦成功，就是完全成功；失敗，則由全域的 Rollback 負責清理 staging。
         payload.staging_dir.rename(payload.final_dir)
         return payload
 
 # ==========================================
-# 5. FLOW / RUNNER
+# 6. FLOW / RUNNER
 # ==========================================
 class Pipeline:
     def __init__(self, actions: list[IAction]):
@@ -346,23 +392,22 @@ class Pipeline:
         return current_payload
 
 def force_rollback(payload: ProcessPayload):
-    if not payload or not payload.staging_dir:
-        return
-        
+    if not payload or not payload.staging_dir: return
     if payload.staging_dir.exists():
-        print(f"\n🗑️ 偵測到中斷，正在銷毀隔離暫存區 {payload.staging_dir.name} ...")
-        for attempt in range(5):
+        print(f"\n🗑️ 系統層級嚴重異常，正在銷毀隔離暫存區 {payload.staging_dir.name} ...")
+        for attempt in range(3):
             try:
                 shutil.rmtree(payload.staging_dir, ignore_errors=False)
-                print("✅ 殘留狀態清除完畢，維持系統潔淨。")
+                print("✅ 殘留狀態清除完畢。")
                 return
             except PermissionError:
-                if attempt < 4: sleep(0.5)
+                sleep(0.5)
             except Exception as e:
                 print(f"⚠️ 清除暫存區失敗：{e}")
+                return
 
 # ==========================================
-# 6. CLIENT ENTRY POINT 
+# 7. CLIENT ENTRY POINT 
 # ==========================================
 if __name__ == "__main__":
     import tkinter as tk
@@ -373,24 +418,37 @@ if __name__ == "__main__":
     root.attributes("-topmost", True)
     
     print("\n" + "="*60)
-    print(" 🧬 VBA 歷史定序引擎 (低記憶體 2PC 工業終極版) 啟動")
+    print(" 🧬 VBA 歷史定序引擎 啟動")
     print("="*60)
     
+    # 1. 選擇全庫來源
     target_folder = filedialog.askdirectory(title="【1. 選擇全庫來源】請選擇包含所有檔案的資料夾")
     if not target_folder: 
-        root.destroy()
-        sys.exit("已取消操作。")
+        print("已取消操作。")
+        sys.exit(0)
 
+    # 2. 指定進化終點
     anchor_file = filedialog.askopenfilename(
         title="【2. 指定進化終點】請選擇「最終定稿」的 Excel 檔案",
         initialdir=target_folder,
         filetypes=[("Excel Files", "*.xls*")]
     )
-    
-    # 確保 GUI 資源第一時間釋放
+    if not anchor_file:
+        print("必須指定最終定稿才能進行演化反推。")
+        sys.exit(0)
+
+    # 3. 指定輸出位置 (預設為來源目錄的上一層，避免污染 Repo)
+    default_out_dir = str(Path(target_folder).parent)
+    output_folder = filedialog.askdirectory(
+        title="【3. 選擇輸出位置】請選擇分析報告與提取檔案的儲存目錄",
+        initialdir=default_out_dir
+    )
+    if not output_folder:
+        print("未指定輸出路徑，已取消操作。")
+        sys.exit(0)
+
+    # 釋放 UI 資源
     root.destroy()
-    
-    if not anchor_file: sys.exit("必須指定最終定稿才能進行演化反推。")
 
     cleanup_flow = Pipeline([
         ActionPreScanAndSequence(),
@@ -399,7 +457,11 @@ if __name__ == "__main__":
         ActionCommitAndFinalize()
     ])
 
-    initial_payload = ProcessPayload(source_dir=Path(target_folder), anchor_file=Path(anchor_file))
+    initial_payload = ProcessPayload(
+        source_dir=Path(target_folder), 
+        anchor_file=Path(anchor_file),
+        output_dir=Path(output_folder)  # 將自訂輸出路徑封裝進 Payload
+    )
     
     try:
         start_time = time()
@@ -412,10 +474,20 @@ if __name__ == "__main__":
         print(f"👻 隔離純複製體 (CLONES): {final_result.stats['clones']} 個檔案")
         if final_result.stats['failed'] > 0:
             print(f"⚠️ 解析失敗隔離 (FAILED): {final_result.stats['failed']} 個檔案")
-        print(f"📂 本次輸出父夾: {final_result.final_dir.name}")
+        print(f"📂 本次輸出父夾: {final_result.final_dir}")
         print("="*60)
         
+    except KeyboardInterrupt:
+        print("\n\n🛑 [使用者中斷] 偵測到手動停止 (Ctrl+C)。")
+        print("依照 [ADR-001] 原則，已停止執行並保留當前處理進度。")
+        if initial_payload.staging_dir and initial_payload.staging_dir.exists():
+            print(f"📂 斷點進度與報表已保留於: {initial_payload.staging_dir}")
+            
     except Exception as e:
         force_rollback(initial_payload)
-        print(f"\n💥 【程式終止】原因: {e}")
-        sys.exit(1)
+        print(f"\n💥 【系統架構級嚴重終止】原因: {e}")
+        
+    finally:
+        print("\n")
+        os.system('pause' if os.name == 'nt' else 'read -p "Press Enter to continue..."')
+        os._exit(0)
