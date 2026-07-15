@@ -1,0 +1,97 @@
+{
+  "description": "【新手教學版】批次改名積木選配指南",
+  "_guide_1": "【重要】積木是由上往下執行的！請遵守「1.先清理雜訊 ➔ 2.再轉換文字 ➔ 3.最後加日期」的順序。",
+  "_guide_2": "想啟用的規則，請保留 rule 名稱；想停用(封印)的規則，請在名稱前加 X (例如 XRegexRule)。",
+  "pipeline": [
+    {
+      "_comment": "=========== PHASE 1: 清理與破壞 (先砍掉不要的雜訊) ==========="
+    },
+    {
+      "_comment": "【規則 A】符號切除。例如設定 left_strip:1，會把第一個底線前面的字全切掉",
+      "rule": "XUnderscoreStripRule",
+      "params": {
+        "left_strip": 1,
+        "right_strip": 1,
+        "sep": "_"
+      }
+    },
+    {
+      "_comment": "【規則 B】移除中括號 [] 或小括號 () 及其包含的內容",
+      "rule": "XRegexRule",
+      "params": {
+        "pattern": "(\\[.*?\\]|\\(.*?\\))\\s*",
+        "replacement": ""
+      }
+    },
+    {
+      "_comment": "=========== PHASE 2: 轉換與正規化 (幫留下的文字做美容) ==========="
+    },
+    {
+      "_comment": "【規則 C】將 YYYY-MM-DD 的日期格式，把減號換成小數點 (建議先跑這條，再跑左右對調)",
+      "rule": "XRegexRule",
+      "params": {
+        "pattern": "(\\d{4})-(\\d{2})-(\\d{2})",
+        "replacement": "\\1.\\2.\\3"
+      }
+    },
+    {
+      "_comment": "【規則 D】用連字號 (-) 將檔名切兩半，並左右對調 (貪婪模式，切在最後一個連字號)",
+      "rule": "XRegexRule",
+      "params": {
+        "pattern": "^(.*)\\s*-\\s*(.*)$",
+        "replacement": "\\2 - \\1"
+      }
+    },
+    {
+      "_comment": "【規則 E】將連續 2 個以上的空白或底線，強制縮減為單一個底線",
+      "rule": "XRegexRule",
+      "params": {
+        "pattern": "[\\s_]{2,}",
+        "replacement": "_"
+      }
+    },
+    {
+      "_comment": "【規則 F】字典文字替換。把不想要的字眼直接換掉 (可設定多組)",
+      "rule": "DictReplaceRule",
+      "params": {
+        "mapping": {
+          "草稿": "v1",
+          "最終版": "Final",
+          " ": "_"
+        }
+      }
+    },
+    {
+      "_comment": "【規則 G】數字補零。解決系統排序錯亂 (例如將 file_1 變成 file_001)",
+      "rule": "ZeroPadRule",
+      "params": {
+        "pad_length": 3
+      }
+    },
+    {
+      "_comment": "【規則 H】大小寫轉換。支援 upper(全大寫), lower(全小寫), title(首字母大寫)",
+      "rule": "CasingRule",
+      "params": {
+        "mode": "lower"
+      }
+    },
+    {
+      "_comment": "=========== PHASE 3: 賦予中繼資料 (最後才加上時間前綴) ==========="
+    },
+    {
+      "_comment": "【規則 I】讀取照片真實拍攝時間 (如果是文件或沒有 EXIF 會自動略過)",
+      "rule": "XExifDateRule",
+      "params": {
+        "time_format": "%Y%m%d_%H%M%S_"
+      }
+    },
+    {
+      "_comment": "【規則 J】加上檔案系統最後修改時間 (預設加在最前面)",
+      "rule": "XOSModifiedTimeRule",
+      "params": {
+        "time_format": "%Y%m%d_",
+        "prefix": ""
+      }
+    }
+  ]
+}
