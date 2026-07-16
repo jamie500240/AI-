@@ -18,7 +18,7 @@
 | [MediaCollapseMigrator](#mediacollapsemigrator--圖片分發整併) | 大量照片依日期/人物分類，並拍平瑣碎的空目錄 | Experimental |
 | [DirectoryFlattener](#directoryflattener--目錄扁平化) | 把多層巢狀資料夾攤平成單層 | Experimental |
 | [AegisArchiver](#aegisarchiver--資安去毒歸檔) | 掃描 PDF 惡意內容，風險檔案隔離、安全檔案去毒後歸檔 | Experimental |
-| [VBAHistorySequencer](#vbahistorysequencer--vba版本血緣分析) | 從一堆 VBA 巨集舊檔中，反推版本演化順序 | Experimental |
+| [VBAHistorySequencer](#vbahistorysequencer--vba-版本血緣分析) | 從一堆 VBA 巨集舊檔中，反推版本演化順序 | Experimental |
 
 **穩定度說明**：目前全數工具皆為 `Experimental`。程式碼已完成 ACDS 審計流程、核心風險項目（雜湊驗證、原子性回滾、命名一致性等）已修復，但尚未在真實資料上經過使用者本人實際執行驗證——AI 審計通過與使用者實測確認是兩道獨立門檻，缺一都不足以稱為 Stable。使用前請先在測試資料夾試跑，並保留原始檔案備份。
 
