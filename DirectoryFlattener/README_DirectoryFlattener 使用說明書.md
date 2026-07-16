@@ -1,4 +1,5 @@
-# 📂 DirectoryFlattener (資料夾扁平化工具)
+# 📂 Script_DirectoryFlattener (資料夾扁平化工具)
+## 把多層巢狀資料夾攤平成單層
 
 本工具旨在將指定資料夾內的「所有子目錄檔案」集中提取至該資料夾的根層級（即「扁平化」），並自動刪除已清空的子目錄。
 
@@ -20,7 +21,7 @@
 ```
 
 *(註：若在 Mac/Linux 環境下，可能需要輸入 `python3 --version`)*
-3. **下載腳本**：將本程式碼儲存為 `flattener.py`（或您自訂的檔名），放置於任意位置即可。
+3. **下載腳本**：將本程式碼儲存為 `Script_DirectoryFlattener.py`（或您自訂的檔名），放置於任意位置即可。
 
 ---
 
@@ -33,7 +34,7 @@
 1. **啟動程式**：
 在終端機中執行該腳本：
 ```bash
-python flattener.py
+python Script_DirectoryFlattener.py
 
 ```
 
