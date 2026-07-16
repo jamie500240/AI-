@@ -1,7 +1,7 @@
 # ==========================================================
 # MODULE:       Script_EnglishFileMigrator
 # PURPOSE:      自動掃描指定資料夾，判定語系並安全移轉英文檔案至專屬目錄，同時生成溯源對照表
-# EXPORTS:      EnglishFileMigrator
+# EXPORTS:      Script_EnglishFileMigrator
 # IMPORTS:      os, shutil, csv, hashlib, logging, datetime, pathlib, docx, pdfminer, pptx, openpyxl, pytesseract, PIL
 # FORBIDDEN:    禁止使用 open('w') 直接覆寫正式報表；禁止使用未經驗證的直接移動（shutil.move）
 # DEPENDENCIES: ACDS_ContractRegistry (CONFIG 變數結構), ACDS_ADR (ADR-001, ADR-002, ADR-003, ADR-004)
@@ -48,7 +48,7 @@ class ContentExtractionError(Exception):
     """自訂例外：內容解析失敗，避免靜默回傳 False"""
     pass
 
-class EnglishFileMigrator:
+class Script_EnglishFileMigrator:
     def __init__(self, root_dir, enable_ocr=False, include_images_in_migration=False):
         self.root = Path(root_dir).resolve()
         self.eng_folder = self.root / CONFIG["ENGLISH_FOLDER"]
@@ -351,7 +351,7 @@ if __name__ == "__main__":
         move_imgs = img_input in ['y', 'yes']
             
         print("\n")
-        migrator = EnglishFileMigrator(
+        migrator = Script_EnglishFileMigrator(
             path_input, 
             enable_ocr=use_ocr,
             include_images_in_migration=move_imgs
