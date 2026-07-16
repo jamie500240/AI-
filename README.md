@@ -11,8 +11,8 @@
 | 工具 | 一句話說明 | 穩定度 |
 |---|---|---|
 | [SafeRenamer](#saferenamer--安全批次改名) | 用可設定的規則批次改檔名，改壞可以復原 | Experimental |
-| [GodCleanup](#godcleanup--檔案清理去重) | 大量檔案去重歸檔，含容量預估與模擬執行 | Stable |
-| [ArchiveAudit](#archiveaudit--歸檔完整性稽核) | 事後比對「搬過去的」跟「原本的」是否一致 | Stable |
+| [GodCleanup](#godcleanup--檔案清理去重) | 大量檔案去重歸檔，含容量預估與模擬執行 | Experimental |
+| [ArchiveAudit](#archiveaudit--歸檔完整性稽核) | 事後比對「搬過去的」跟「原本的」是否一致 | Experimental |
 | [EnglishFileMigrator](#englishfilemigrator--英文檔案分流) | 依內容語系自動把英文檔案分流到獨立資料夾 | Experimental |
 | [OmniArchiveMigrator](#omniarchivemigrator--全能命名歸檔) | 判斷檔名品質，用內容特徵重新命名雜亂檔案 | Experimental |
 | [MediaCollapseMigrator](#mediacollapsemigrator--圖片分發整併) | 大量照片依日期/人物分類，並拍平瑣碎的空目錄 | Experimental |
@@ -20,7 +20,7 @@
 | [AegisArchiver](#aegisarchiver--資安去毒歸檔) | 掃描 PDF 惡意內容，風險檔案隔離、安全檔案去毒後歸檔 | Experimental |
 | [VBAHistorySequencer](#vbahistorysequencer--vba版本血緣分析) | 從一堆 VBA 巨集舊檔中，反推版本演化順序 | Experimental |
 
-**穩定度說明**：`Stable` 代表已完成 ACDS 審計流程且核心風險項目已修復；`Experimental` 代表功能可用但尚未完整走完稽核迴圈，建議先在測試資料夾試跑，並保留原始檔案備份。
+**穩定度說明**：目前全數工具皆為 `Experimental`。程式碼已完成 ACDS 審計流程、核心風險項目（雜湊驗證、原子性回滾、命名一致性等）已修復，但尚未在真實資料上經過使用者本人實際執行驗證——AI 審計通過與使用者實測確認是兩道獨立門檻，缺一都不足以稱為 Stable。使用前請先在測試資料夾試跑，並保留原始檔案備份。
 
 ---
 
