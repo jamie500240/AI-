@@ -5,7 +5,7 @@
 # IMPORTS:      hashlib, csv, os, datetime, pathlib, collections.defaultdict
 # FORBIDDEN:    禁止靜默忽略無法讀取的檔案；禁止直接移動或刪除任何檔案。
 # DEPENDENCIES: 本機 IO 權限; [Schema] REPORT_PREFIX, CSV_HEADERS
-# VERSION:      1.0.4 [Stability: Stable]
+# VERSION:      1.0.4 [Stability: Experimental]
 # ==========================================================
 
 import hashlib
