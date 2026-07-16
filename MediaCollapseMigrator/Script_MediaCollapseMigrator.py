@@ -1,14 +1,14 @@
 # ==========================================================
-# MODULE: Mod_MediaCollapseMigrator
-# PURPOSE: 自動掃描指定資料夾，提取圖片 DNA，將檔案安全移轉至分發目錄，執行貪婪坍塌平攤無意義隧道，並生成溯源對照表
-# EXPORTS: Mod_MediaCollapseMigrator
-# IMPORTS: shutil, csv, hashlib, logging, time, pathlib, re, threading, tkinter, tqdm, PIL, numpy, concurrent.futures
-# FORBIDDEN: 禁止使用 open('w') 直接覆寫正式報表；禁止使用未經驗證的直接移動（shutil.move）
+# MODULE:       Script_MediaCollapseMigrator
+# PURPOSE:      自動掃描指定資料夾，提取圖片 DNA，將檔案安全移轉至分發目錄，執行貪婪坍塌平攤無意義隧道，並生成溯源對照表
+# EXPORTS:      Script_MediaCollapseMigrator
+# IMPORTS:      shutil, csv, hashlib, logging, time, pathlib, re, threading, tkinter, tqdm, PIL, numpy, concurrent.futures
+# FORBIDDEN:    禁止使用 open('w') 直接覆寫正式報表；禁止使用未經驗證的直接移動（shutil.move）
 # DEPENDENCIES: PIL, numpy, tqdm
-# VERSION: 1.0.0 [Stability: Experimental]
+# VERSION:      1.0.0 [Stability: Experimental]
 # ADR: 
-# - ADR-005: 放棄 ACDS_ContractRegistry 外部依賴，將 CONFIG 轉為模組內部常數，以支援無相依環境之 Standalone 獨立執行。
-# - ADR-006: 導入 safe_move 全面取代 shutil.move，包含例外回滾機制亦須遵守「複製+驗證+刪除」原則；同時引入 try-finally 確保中斷時必產出溯源報表。觸發 Major 版本升級。
+# - ADR-005:    放棄 ACDS_ContractRegistry 外部依賴，將 CONFIG 轉為模組內部常數，以支援無相依環境之 Standalone 獨立執行。
+# - ADR-006:    導入 safe_move 全面取代 shutil.move，包含例外回滾機制亦須遵守「複製+驗證+刪除」原則；同時引入 try-finally 確保中斷時必產出溯源報表。觸發 Major 版本升級。
 # ==========================================================
 
 import shutil
@@ -40,7 +40,7 @@ CONFIG = {
     "FAILED_DIR": "[FAILED_TO_PROCESS]"
 }
 
-class Mod_MediaCollapseMigrator:
+class Script_MediaCollapseMigrator:
     def __init__(self, source_path):
         self.root = Path(source_path).resolve()
         self.timestamp = time.strftime('%H%M%S')
@@ -176,7 +176,7 @@ class Mod_MediaCollapseMigrator:
             return {"file": fpath, "is_img": False, "error": str(e), "failed": True}
 
     def execute(self):
-        logging.info("啟動 Mod_MediaCollapseMigrator (V3.0.0)。DNA 分析與分發模式運轉中...")
+        logging.info("啟動 Script_MediaCollapseMigrator (V3.0.0)。DNA 分析與分發模式運轉中...")
         all_files = [f for f in self.root.rglob("*") if f.is_file()]
         
         with ThreadPoolExecutor() as exc:
@@ -244,5 +244,5 @@ if __name__ == "__main__":
     Tk().withdraw()
     p = filedialog.askdirectory(title="選擇要進行坍塌重構的來源資料夾")
     if p: 
-        Mod_MediaCollapseMigrator(p).execute()
+        Script_MediaCollapseMigrator(p).execute()
     input("\n[程序終點] 按下 Enter 結束並檢核最終成果。")
