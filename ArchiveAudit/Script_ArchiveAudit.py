@@ -1,5 +1,5 @@
 # ==========================================================
-# MODULE:       ArchiveAudit
+# MODULE:       Script_ArchiveAudit
 # PURPOSE:      比對原始資料夾與歸檔資料夾之內容，依據 Hash 驗證是否遺漏或撞名。
 # EXPORTS:      RunApp()
 # IMPORTS:      hashlib, csv, os, datetime, pathlib, collections.defaultdict
