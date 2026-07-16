@@ -1,4 +1,4 @@
-# 📂 English File Migrator (分流中英文檔案 / 英文檔案自動化移轉系統)
+# 📂 Script_EnglishFileMigrator (分流中英文檔案 / 英文檔案自動化移轉系統)
 
 **版本:** v2.0.0 [Experimental]
 
@@ -88,7 +88,7 @@ python Script_EnglishFileMigrator.py
 
 ```text
 ============================================================
- 英文檔案自動化移轉系統啟動 v2.0.1 [Experimental]
+ 英文檔案自動化移轉系統啟動 v2.0.0 [Experimental]
 ============================================================
 請輸入目標資料夾路徑: C:\Users\User\Desktop\TestDocs
 是否啟用圖片內容 OCR 辨識？(需安裝 tesseract) [y/N]: N
