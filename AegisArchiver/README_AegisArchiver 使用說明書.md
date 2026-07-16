@@ -1,4 +1,5 @@
-# AegisArchiver
+# 📂 AegisArchiver (pdf 去毒歸檔)
+
 
 AegisArchiver 是一套具備溯源追蹤能力與自動化資安防護的檔案歸檔工具。本程式設計用於批次處理指定目錄下的靜態檔案，能自動偵測 PDF 檔案的潛在風險標籤並進行實體隔離，確保歸檔區（Safe Zone）的檔案純淨，並產出符合單一真相來源（SSOT）標準的審計報表。
 
