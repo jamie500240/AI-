@@ -61,7 +61,7 @@ class Script_EnglishFileMigrator:
         self.include_images = include_images_in_migration
         
         # 初始化 Logging
-        self.logger = logging.getLogger("EnglishMigrator")
+        self.logger = logging.getLogger("Script_EnglishFileMigrator")
         self.logger.setLevel(logging.INFO)
         if not self.logger.handlers:
             ch = logging.StreamHandler()
@@ -336,7 +336,7 @@ if __name__ == "__main__":
     os.system('cls' if os.name == 'nt' else 'clear')
     
     print("="*60)
-    print(" 英文檔案自動化移轉系統啟動 v2.0.1 [Experimental]")
+    print(" 英文檔案自動化移轉系統啟動 v2.0.0 [Experimental]")
     print("="*60)
     
     try:
