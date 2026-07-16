@@ -1,5 +1,5 @@
 # ==========================================================
-# MODULE: AegisArchiver
+# MODULE: Script_AegisArchiver
 # PURPOSE: 自動掃描指定資料夾，執行資安檢測。安全檔案予以去毒引渡；風險檔案移至隔離區，並於安全區留下溯源佔位符。
 # EXPORTS: AegisArchiver
 # IMPORTS: os, csv, shutil, sys, pathlib, datetime, pikepdf, tqdm, logging, hashlib
